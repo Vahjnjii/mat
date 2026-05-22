@@ -8,6 +8,7 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import axios from "axios";
 import dotenv from "dotenv";
 import { runJob, activeJobs } from "./jobStore";
+import sharp from "sharp";
 
 dotenv.config();
 
@@ -171,23 +172,35 @@ async function startServer() {
       let validScenesCount = 0;
       for (let i = 0; i < scenes.length; i++) {
         const scene = scenes[i];
-        const imgPath = path.join(sessionDir, `img_${i}.webp`);
+        const imgPath = path.join(sessionDir, `img_${i}.jpg`);
         
+        let rawBuffer: Buffer | null = null;
         if (scene.imageUrl.startsWith("data:")) {
           const baseData = scene.imageUrl.split(",")[1];
-          fs.writeFileSync(imgPath, Buffer.from(baseData, "base64"));
+          rawBuffer = Buffer.from(baseData, "base64");
         } else if (scene.imageUrl.startsWith("http")) {
           try {
-            // Download if it's a URL
             const response = await axios.get(scene.imageUrl, { responseType: 'arraybuffer', timeout: 10000 });
-            fs.writeFileSync(imgPath, response.data);
+            rawBuffer = Buffer.from(response.data);
           } catch (dlErr) {
             console.error(`Failed to download image from ${scene.imageUrl}`, dlErr);
-            continue; // Skip this scene if we fail to download image
+            continue; // Skip this scene
           }
         } else {
           console.warn(`Invalid image URL at scene ${i}:`, scene.imageUrl);
           continue; // Skip this scene
+        }
+        
+        // Normalize the image buffer perfectly with sharp!
+        try {
+           const normalizedBuffer = await sharp(rawBuffer)
+               .resize({ width: 768, height: 1344, fit: 'cover' })
+               .jpeg({ quality: 90 })
+               .toBuffer();
+           fs.writeFileSync(imgPath, normalizedBuffer);
+        } catch(sharpErr) {
+           console.error(`Failed to process image with sharp for scene ${i}:`, sharpErr);
+           continue; // Skip
         }
         
         imagePaths.push(imgPath);

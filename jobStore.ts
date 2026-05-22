@@ -4,6 +4,7 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import axios from "axios";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
+import sharp from 'sharp';
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -220,7 +221,7 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
 
         // 3. Last Resort Fallback Placeholder
         if (!success) {
-            console.error(`Failed to generate image ${i}, using basic safe fallback image`);
+            console.error(`Failed to generate image ${i}, trying basic pollinations fallback`);
             try {
               const polyRes = await axios.get(`https://image.pollinations.ai/prompt/cinematic%20anime%20scene%20beautiful%20sky?width=768&height=1344`, {
                  responseType: 'arraybuffer', timeout: 10000
@@ -230,9 +231,33 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
               fs.writeFileSync(path.join(sessionDir, `img_${i}.jpg`), imgBuffer);
               job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + imgBuffer.toString('base64');
             } catch(e) {
-              const blackJpeg = Buffer.from("/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAAIAAgBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=", "base64");
-              fs.writeFileSync(path.join(sessionDir, `img_${i}.jpg`), blackJpeg);
-              job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + blackJpeg.toString('base64');
+              if (i > 0) {
+                 console.log(`Using previous image for scene ${i} as fallback fallback`);
+                 fs.copyFileSync(path.join(sessionDir, `img_${i-1}.jpg`), path.join(sessionDir, `img_${i}.jpg`));
+                 job.scenes[i].imageUrl = job.scenes[i-1].imageUrl;
+              } else {
+                 console.log("No previous image to fallback to, but keeping sequence alive by ignoring for now");
+              }
+            }
+        }
+        
+        // Normalize with sharp to absolutely guarantee identical dimensions for ffmpeg concat
+        try {
+            const imgPath = path.join(sessionDir, `img_${i}.jpg`);
+            if (fs.existsSync(imgPath)) {
+                const buffer = fs.readFileSync(imgPath);
+                const normalizedBuffer = await sharp(buffer)
+                    .resize({ width: 768, height: 1344, fit: 'cover' })
+                    .jpeg({ quality: 90 })
+                    .toBuffer();
+                fs.writeFileSync(imgPath, normalizedBuffer);
+                job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + normalizedBuffer.toString('base64');
+            }
+        } catch(e) {
+            console.error(`Failed to normalize image with sharp for scene ${i}:`, e);
+            if (i > 0) {
+                 fs.copyFileSync(path.join(sessionDir, `img_${i-1}.jpg`), path.join(sessionDir, `img_${i}.jpg`));
+                 job.scenes[i].imageUrl = job.scenes[i-1].imageUrl;
             }
         }
         
