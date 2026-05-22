@@ -8,7 +8,6 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import axios from "axios";
 import dotenv from "dotenv";
 import { runJob, activeJobs } from "./jobStore";
-import sharp from "sharp";
 
 dotenv.config();
 
@@ -192,16 +191,32 @@ async function startServer() {
           continue; // Skip this scene
         }
         
-        // Normalize the image buffer perfectly with sharp!
+        // Normalize the image buffer perfectly with FFmpeg to prevent native module crashes
         try {
-           const normalizedBuffer = await sharp(rawBuffer)
-               .resize({ width: 768, height: 1344, fit: 'cover' })
-               .jpeg({ quality: 90 })
-               .toBuffer();
-           fs.writeFileSync(imgPath, normalizedBuffer);
-        } catch(sharpErr) {
-           console.error(`Failed to process image with sharp for scene ${i}:`, sharpErr);
-           continue; // Skip
+            const rawTempPath = path.join(sessionDir, `raw_temp_${i}.jpg`);
+            if (rawBuffer) {
+                fs.writeFileSync(rawTempPath, rawBuffer);
+            } else {
+                continue;
+            }
+            
+            await new Promise<void>((resolve, reject) => {
+                ffmpeg(rawTempPath)
+                    .outputOptions([
+                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+                        '-vframes', '1'
+                    ])
+                    .save(imgPath)
+                    .on('end', () => resolve())
+                    .on('error', (err) => reject(err));
+            });
+            
+            if (fs.existsSync(rawTempPath)) {
+                fs.unlinkSync(rawTempPath);
+            }
+        } catch(ffmpegErr) {
+            console.error(`Failed to process image with FFmpeg for scene ${i}:`, ffmpegErr);
+            continue; // Skip
         }
         
         imagePaths.push(imgPath);

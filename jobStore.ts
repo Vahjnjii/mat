@@ -4,7 +4,6 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import axios from "axios";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
-import sharp from 'sharp';
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -241,20 +240,33 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
             }
         }
         
-        // Normalize with sharp to absolutely guarantee identical dimensions for ffmpeg concat
+        // Normalize with FFmpeg to absolutely guarantee identical dimensions for ffmpeg concat
         try {
             const imgPath = path.join(sessionDir, `img_${i}.jpg`);
             if (fs.existsSync(imgPath)) {
-                const buffer = fs.readFileSync(imgPath);
-                const normalizedBuffer = await sharp(buffer)
-                    .resize({ width: 768, height: 1344, fit: 'cover' })
-                    .jpeg({ quality: 90 })
-                    .toBuffer();
-                fs.writeFileSync(imgPath, normalizedBuffer);
+                const rawTempPath = path.join(sessionDir, `raw_temp_${i}.jpg`);
+                fs.renameSync(imgPath, rawTempPath);
+                
+                await new Promise<void>((resolve, reject) => {
+                    ffmpeg(rawTempPath)
+                        .outputOptions([
+                            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
+                            '-vframes', '1'
+                        ])
+                        .save(imgPath)
+                        .on('end', () => resolve())
+                        .on('error', (err) => reject(err));
+                });
+                
+                if (fs.existsSync(rawTempPath)) {
+                    fs.unlinkSync(rawTempPath);
+                }
+                
+                const normalizedBuffer = fs.readFileSync(imgPath);
                 job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + normalizedBuffer.toString('base64');
             }
         } catch(e) {
-            console.error(`Failed to normalize image with sharp for scene ${i}:`, e);
+            console.error(`Failed to normalize image with FFmpeg for scene ${i}:`, e);
             if (i > 0) {
                  fs.copyFileSync(path.join(sessionDir, `img_${i-1}.jpg`), path.join(sessionDir, `img_${i}.jpg`));
                  job.scenes[i].imageUrl = job.scenes[i-1].imageUrl;
