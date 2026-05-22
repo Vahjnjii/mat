@@ -161,10 +161,11 @@ async function startServer() {
       let srtContent = "";
 
       const formatSrtTime = (seconds: number) => {
-          const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
-          const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
-          const s = Math.floor(seconds % 60).toString().padStart(2, '0');
-          const ms = Math.floor((seconds * 1000) % 1000).toString().padStart(3, '0');
+          const cleanSecs = isNaN(seconds) || seconds < 0 ? 0 : seconds;
+          const h = Math.floor(cleanSecs / 3600).toString().padStart(2, '0');
+          const m = Math.floor((cleanSecs % 3600) / 60).toString().padStart(2, '0');
+          const s = Math.floor(cleanSecs % 60).toString().padStart(2, '0');
+          const ms = Math.floor((cleanSecs * 1000) % 1000).toString().padStart(3, '0');
           return `${h}:${m}:${s},${ms}`;
       };
 
@@ -207,15 +208,16 @@ async function startServer() {
         
         // Calculate duration: if it's the last scene, we might need a default or use the total audio length
         // But for now we rely on the duration provided by the client
+        const sceneDur = (typeof scene.duration === "number" && !isNaN(scene.duration)) ? scene.duration : 5;
         concatContent += `file '${path.resolve(imgPath)}'\n`;
-        concatContent += `duration ${scene.duration}\n`;
+        concatContent += `duration ${sceneDur}\n`;
 
-        // Build SRT
-        const start = scene.timestamp;
-        const end = scene.timestamp + (scene.duration || 5);
+        // Build SRT safely
+        const start = (typeof scene.timestamp === "number" && !isNaN(scene.timestamp)) ? scene.timestamp : (validScenesCount * 5);
+        const end = start + sceneDur;
         srtContent += `${validScenesCount + 1}\n`;
         srtContent += `${formatSrtTime(start)} --> ${formatSrtTime(end)}\n`;
-        srtContent += `${scene.text}\n\n`;
+        srtContent += `${scene.text || ""}\n\n`;
         validScenesCount++;
       }
       

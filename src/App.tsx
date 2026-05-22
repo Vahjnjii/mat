@@ -1145,6 +1145,7 @@ jobs:
         }
 
         return {
+          ...scene,
           imageUrl: imgFinal,
           duration: Math.max(0.1, nextTimestamp - scene.timestamp)
         };
@@ -1202,7 +1203,7 @@ jobs:
                 },
                 name: 'output.mp4',
                 data: buffer as any
-             });
+             } as any);
              setStatus('Ready! Saved securely to GitHub.');
              
              // Update local dbProjects URL
@@ -1350,7 +1351,7 @@ jobs:
                 }
                 
                 // Upload asset
-                await octokit.repos.uploadReleaseAsset({
+                await (octokit.repos.uploadReleaseAsset as any)({
                    url: uploadUrl,
                    headers: {
                        'content-type': 'video/mp4',
