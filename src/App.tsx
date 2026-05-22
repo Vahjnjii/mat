@@ -28,6 +28,7 @@ import {
   ArrowUp
 } from 'lucide-react';
 import { Octokit } from '@octokit/rest';
+import localforage from 'localforage';
 
 if (typeof document !== 'undefined') {
   const link = document.createElement('link');
@@ -248,6 +249,21 @@ export default function App() {
 
       const loadProjectData = async () => {
         setIsLoadingProject(true);
+        
+        try {
+           const localData: any = await localforage.getItem(`project_state_${selectedProjectId}`);
+           if (localData && localData.scenes && localData.audioBase64) {
+              setScenes(localData.scenes);
+              setAudioUrl(`data:audio/wav;base64,${localData.audioBase64}`);
+              setDuration(localData.duration || 0);
+              console.log("Loaded cached project state from localforage!");
+              setIsLoadingProject(false);
+              return; // We have everything we need!
+           }
+        } catch(e) {
+           console.warn("Localforage load failed", e);
+        }
+
         const octokit = new Octokit({ auth: githubToken });
         const owner = user.login;
         const repo = getProjectRepoName();
@@ -1072,11 +1088,14 @@ jobs:
     }
   };
 
+  const [autoRecordSignal, setAutoRecordSignal] = useState<string | null>(null);
+
   useEffect(() => {
-    if ((window as any).isHeadless && scenes.length > 0 && !isGenerating && !isPlaying && audioUrl) {
-      handleRecordVideo();
+    if (autoRecordSignal && scenes.length > 0 && !isGenerating && !isPlaying && audioUrl) {
+      handleRecordVideo(autoRecordSignal);
+      setAutoRecordSignal(null);
     }
-  }, [scenes, isGenerating, isPlaying, audioUrl]);
+  }, [scenes, isGenerating, isPlaying, audioUrl, autoRecordSignal]);
 
   const handleStitchVideo = async () => {
     if (scenes.length === 0 || !audioUrl) return;
@@ -1163,11 +1182,15 @@ jobs:
     }
   };
 
-  const isRecordingRef = useRef(false);
-  const handleRecordVideo = async () => {
+    const isRecordingRef = useRef(false);
+  const handleRecordVideo = async (targetProjectId?: string) => {
     if (!canvasRef.current || !audioUrl) return;
     if (isRecordingRef.current) return;
     isRecordingRef.current = true;
+    
+    // Switch UI mode to show rendering layout
+    setSelectedProjectId(null); // Deselect so we see the main canvas 
+    const finalProjectId = targetProjectId || selectedProjectId || localStorage.getItem('lastProjectId') || `temp_${Date.now()}`;
     
     try {
       await document.fonts.ready;
@@ -1258,7 +1281,49 @@ jobs:
         const mp4Blob = await response.blob();
         const url = URL.createObjectURL(mp4Blob);
         
-        // Trigger download
+        // Upload to Github Release!
+        if (githubToken && user && finalProjectId) {
+            setStatus('Uploading precise high-quality MP4 to GitHub Releases...');
+            try {
+                const octokit = new Octokit({ auth: githubToken });
+                const owner = user.login;
+                const repo = getProjectRepoName();
+                
+                // Read as buffer
+                const arrayBuffer = await mp4Blob.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+                
+                // Get or create release
+                let uploadUrl = "";
+                const tag = `vid-${finalProjectId}`;
+                try {
+                   const { data: rel } = await octokit.repos.getReleaseByTag({ owner, repo, tag });
+                   uploadUrl = rel.upload_url;
+                } catch(e: any) {
+                   const { data: newRel } = await octokit.repos.createRelease({ owner, repo, tag_name: tag, name: `Video ${finalProjectId || ''}`, body: "Rendered locally" });
+                   uploadUrl = newRel.upload_url;
+                }
+                
+                // Upload asset
+                await octokit.repos.uploadReleaseAsset({
+                   url: uploadUrl,
+                   headers: {
+                       'content-type': 'video/mp4',
+                       'content-length': buffer.length
+                   },
+                   name: 'output.mp4',
+                   data: buffer as any
+                });
+                setStatus('Ready! Saved securely to GitHub.');
+                
+                // Update local dbProjects URL
+                fetchProjects(octokit, owner);
+            } catch(e) {
+                console.warn("Failed to upload to Github release", e);
+            }
+        }
+        
+        // Trigger download optionally
         const a = document.createElement("a");
         a.href = url;
         a.download = `video_render_${Date.now()}.mp4`;
@@ -1513,13 +1578,24 @@ jobs:
           else if (job.status === 'stitching') setStatus('Stitching video frames and audio rapidly via FFmpeg...');
           else if (job.status === 'uploading') setStatus('Uploading MP4 to your GitHub Releases...');
           else if (job.status === 'completed') {
-             setStatus(`Success! Project saved securely in your GitHub Releases.`);
+             setStatus(`Success! Project generated successfully.`);
              if (job.scenes && job.scenes.length > 0) {
                setScenes(job.scenes);
              }
              if (job.audioBase64) {
                setAudioUrl(`data:audio/wav;base64,${job.audioBase64}`);
                setDuration(job.duration || 0);
+             }
+             
+             // Save to localforage
+             try {
+                await localforage.setItem(`project_state_${activeJobId}`, {
+                   scenes: job.scenes,
+                   audioBase64: job.audioBase64,
+                   duration: job.duration
+                });
+             } catch(err) {
+                console.error("Failed to save to localforage", err);
              }
              
              // Update dbProjects
@@ -1531,6 +1607,9 @@ jobs:
 
              setIsGenerating(false);
              setActiveJobId(null);
+             
+             // Setup auto recording
+             setAutoRecordSignal(activeJobId);
           } else if (job.status === 'failed') {
              setError(job.error || "Backend job failed");
              setStatus("");
