@@ -154,15 +154,31 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
            try {
              workerUrl = activeImageWorkers[(i + attempts) % activeImageWorkers.length];
              const res = await axios.post(workerUrl, 
-               { inputs: fullPrompt },
+               { prompt: fullPrompt },
                { responseType: 'arraybuffer', timeout: 30000 }
              );
              
-             const imgBuffer = Buffer.from(res.data, 'binary');
-             const imgPath = path.join(sessionDir, `img_${i}.jpg`);
-             fs.writeFileSync(imgPath, imgBuffer);
+             const imgBufferRaw = Buffer.from(res.data, 'binary');
+             let finalImgBuffer = imgBufferRaw;
              
-             job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + imgBuffer.toString('base64');
+             if (imgBufferRaw[0] === 123) { // 123 is '{'
+                const textData = imgBufferRaw.toString('utf-8');
+                try {
+                  const json = JSON.parse(textData);
+                  const b64 = json.image || json.result?.image || json.img;
+                  if (b64) {
+                    const base64Data = b64.replace(/^data:image\/\w+;base64,/, "");
+                    finalImgBuffer = Buffer.from(base64Data, 'base64');
+                  }
+                } catch(e) {
+                  // ignore parse err
+                }
+             }
+
+             const imgPath = path.join(sessionDir, `img_${i}.jpg`);
+             fs.writeFileSync(imgPath, finalImgBuffer);
+             
+             job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + finalImgBuffer.toString('base64');
              success = true;
            } catch(err: any) {
              console.warn(`[${jobId}] Image ${i} attempt ${attempts} failed on worker ${workerUrl}`);
@@ -204,94 +220,20 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
             }
         }
         
-        job.progress = 25 + (i / job.scenes.length) * 40;
+        job.progress = 25 + (i / job.scenes.length) * 60;
         activeJobs.set(jobId, { ...job });
-    }
-
-    job.status = 'stitching';
-    job.progress = 65;
-    activeJobs.set(jobId, { ...job });
-    console.log(`[${jobId}] Stitching video...`);
-
-    const concatFilePath = path.join(sessionDir, "concat.txt");
-    const srtFilePath = path.join(sessionDir, "subs.srt");
-    let concatContent = "";
-    let srtContent = "";
-
-    const formatSrtTime = (seconds: number) => {
-        const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
-        const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
-        const s = Math.floor(seconds % 60).toString().padStart(2, '0');
-        const ms = Math.floor((seconds * 1000) % 1000).toString().padStart(3, '0');
-        return `${h}:${m}:${s},${ms}`;
-    };
-
-    for(let i = 0; i < job.scenes.length; i++) {
-        const scene = job.scenes[i];
-        concatContent += `file '${path.resolve(sessionDir, `img_${i}.jpg`)}'\n`;
-        concatContent += `duration ${scene.duration}\n`;
-        
-        // Build SRT
-        const start = scene.timestamp;
-        const end = scene.timestamp + (scene.duration || 5);
-        srtContent += `${i + 1}\n`;
-        srtContent += `${formatSrtTime(start)} --> ${formatSrtTime(end)}\n`;
-        srtContent += `${scene.text}\n\n`;
-    }
-    if (job.scenes.length > 0) {
-        concatContent += `file '${path.resolve(sessionDir, `img_${job.scenes.length - 1}.jpg`)}'\n`;
-    }
-    fs.writeFileSync(concatFilePath, concatContent);
-    fs.writeFileSync(srtFilePath, srtContent);
-
-    const outputPath = path.join(sessionDir, "output.mp4");
-
-    await new Promise((resolve, reject) => {
-        // Use subtitles filter with styling for word wrap
-        // Alignment=2 means bottom-center, MarginV=50 for some padding
-        const vfParams = `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,subtitles=${path.resolve(srtFilePath).replace(/\\/g, '/').replace(/:/g, '\\\\:')}:force_style='Fontname=Arial,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,Alignment=2,MarginV=50'`;
-
-        ffmpeg()
-        .input(concatFilePath)
-        .inputOptions(["-f concat", "-safe 0"])
-        .input(audioPath)
-        .outputOptions([
-          '-c:v libx264',
-          '-pix_fmt yuv420p',
-          `-vf`, vfParams,
-          '-preset fast',
-          '-crf 22',
-          '-c:a aac',
-          '-b:a 192k',
-          '-shortest',
-          '-movflags +faststart'
-        ])
-        .save(outputPath)
-        .on('end', () => resolve(true))
-        .on('error', (err, stdout, stderr) => {
-            console.error("FFmpeg Error:", err);
-            reject(new Error("Video stitching failed: " + err.message));
-        });
-    });
-
-    job.status = 'uploading';
-    job.progress = 85;
-    activeJobs.set(jobId, { ...job });
-    console.log(`[${jobId}] Uploading to GitHub releases...`);
-
-    if (githubToken) {
-       job.videoUrl = await uploadToGithubRelease(githubToken, jobId, outputPath, script);
     }
 
     job.status = 'completed';
     job.progress = 100;
     activeJobs.set(jobId, { ...job });
-    console.log(`[${jobId}] Completely done!`);
+    console.log(`[${jobId}] Image generation and audio complete! Ready for canvas rendering.`);
     
+    // Cleanup memory after a while, let frontend grab it
     setTimeout(() => {
         activeJobs.delete(jobId);
         fs.rm(sessionDir, { recursive: true, force: true }, () => {});
-    }, 10 * 60 * 1000);
+    }, 20 * 60 * 1000);
 
   } catch (err: any) {
     console.error(`[${jobId}] Job Failed:`, err);

@@ -1074,7 +1074,7 @@ jobs:
 
   useEffect(() => {
     if ((window as any).isHeadless && scenes.length > 0 && !isGenerating && !isPlaying && audioUrl) {
-      handleStitchVideo();
+      handleRecordVideo();
     }
   }, [scenes, isGenerating, isPlaying, audioUrl]);
 
@@ -1565,8 +1565,33 @@ jobs:
     setProgress(0);
     setScenes([]);
     setAudioUrl(null);
-    setStatus('Dispatching task to backend...');
 
+    // If we have github token and we are NOT in headless mode, trigger the Github Action by uploading the raw script!
+    if (!(window as any).isHeadless && githubToken && user) {
+       setStatus('Dispatching script to GitHub Actions for headless canvas rendering...');
+       try {
+         const timestamp = Date.now().toString();
+         const octokit = new Octokit({ auth: githubToken });
+         await uploadRawProjectToGitHub(octokit, user.login, timestamp, textToUse, apiKeys, imageUrls);
+         
+         setStatus('Sent to GitHub Actions. Video will be available in History once rendered.');
+         setSelectedProjectId(null);
+         
+         // Add optimistic pending project so they see it polling
+         setDbProjects(prev => {
+            const newProj: Project = { id: timestamp, status: 'rendering', script: textToUse, userId: user.login, createdAt: new Date() };
+            return [newProj, ...(prev || [])];
+         });
+         
+         setIsGenerating(false);
+       } catch(err: any) {
+         setError(err.message || "Failed to dispatch to Github Actions");
+         setIsGenerating(false);
+       }
+       return;
+    }
+
+    setStatus('Dispatching task to AI Studio backend...');
     setSelectedProjectId(null);
 
     try {
@@ -2167,6 +2192,15 @@ jobs:
 
              {selectedProjectId && dbProjects.find(p => p.id === selectedProjectId) && (
                (dbProjects.find(p => p.id === selectedProjectId)?.status === 'ready' && selectedProjectId !== activeJobId) ? (
+                 <>
+                 <button 
+                   onClick={() => handleRecordVideo()}
+                   disabled={scenes.length === 0 || !audioUrl || isRecordingRef.current}
+                   className="hidden sm:flex items-center gap-2 border border-orange-500/30 bg-orange-500/10 hover:bg-orange-500/20 text-orange-500 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                 >
+                   <Download size={14} />
+                   Export Canvas Video
+                 </button>
                  <button 
                    onClick={() => {
                      const url = dbProjects.find(p => p.id === selectedProjectId)?.videoUrl;
@@ -2177,6 +2211,7 @@ jobs:
                    <Download size={14} />
                    Get Actions MP4
                  </button>
+                 </>
                ) : (
                  <button 
                    disabled
