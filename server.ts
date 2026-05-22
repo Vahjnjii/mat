@@ -147,10 +147,6 @@ async function startServer() {
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
 
     try {
-      const imagePaths: string[] = [];
-      const concatFilePath = path.join(sessionDir, "concat.txt");
-      let concatContent = "";
-
       // Save audio
       const audioPath = path.join(sessionDir, "audio.wav");
       const audioBuffer = Buffer.from(audioBase64, "base64");
@@ -168,17 +164,19 @@ async function startServer() {
           return `${h}:${m}:${s},${ms}`;
       };
 
-      // Process scenes
+      // Process and download scenes in memory/disk
+      const scenesToStitch: { imgPath: string; duration: number }[] = [];
       let validScenesCount = 0;
+
       for (let i = 0; i < scenes.length; i++) {
         const scene = scenes[i];
         const imgPath = path.join(sessionDir, `img_${i}.jpg`);
         
         let rawBuffer: Buffer | null = null;
-        if (scene.imageUrl.startsWith("data:")) {
+        if (scene.imageUrl?.startsWith("data:")) {
           const baseData = scene.imageUrl.split(",")[1];
           rawBuffer = Buffer.from(baseData, "base64");
-        } else if (scene.imageUrl.startsWith("http")) {
+        } else if (scene.imageUrl?.startsWith("http")) {
           try {
             const response = await axios.get(scene.imageUrl, { responseType: 'arraybuffer', timeout: 10000 });
             rawBuffer = Buffer.from(response.data);
@@ -191,97 +189,85 @@ async function startServer() {
           continue; // Skip this scene
         }
         
-        // Normalize the image buffer perfectly with FFmpeg to prevent native module crashes
-        try {
-            const rawTempPath = path.join(sessionDir, `raw_temp_${i}.jpg`);
-            if (rawBuffer) {
-                fs.writeFileSync(rawTempPath, rawBuffer);
-            } else {
-                continue;
-            }
-            
-            await new Promise<void>((resolve, reject) => {
-                ffmpeg(rawTempPath)
-                    .outputOptions([
-                        '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                        '-vframes', '1'
-                    ])
-                    .save(imgPath)
-                    .on('end', () => resolve())
-                    .on('error', (err) => reject(err));
-            });
-            
-            if (fs.existsSync(rawTempPath)) {
-                fs.unlinkSync(rawTempPath);
-            }
-        } catch(ffmpegErr) {
-            console.error(`Failed to process image with FFmpeg for scene ${i}:`, ffmpegErr);
-            continue; // Skip
+        if (rawBuffer) {
+          fs.writeFileSync(imgPath, rawBuffer);
+          const sceneDur = (typeof scene.duration === "number" && !isNaN(scene.duration)) ? scene.duration : 5;
+          const start = (typeof scene.timestamp === "number" && !isNaN(scene.timestamp)) ? scene.timestamp : (validScenesCount * 5);
+          
+          scenesToStitch.push({
+            imgPath,
+            duration: sceneDur
+          });
+
+          // Build SRT safely
+          const end = start + sceneDur;
+          srtContent += `${validScenesCount + 1}\n`;
+          srtContent += `${formatSrtTime(start)} --> ${formatSrtTime(end)}\n`;
+          srtContent += `${scene.text || ""}\n\n`;
+          validScenesCount++;
         }
-        
-        imagePaths.push(imgPath);
-        
-        // Calculate duration: if it's the last scene, we might need a default or use the total audio length
-        // But for now we rely on the duration provided by the client
-        const sceneDur = (typeof scene.duration === "number" && !isNaN(scene.duration)) ? scene.duration : 5;
-        concatContent += `file '${path.resolve(imgPath)}'\n`;
-        concatContent += `duration ${sceneDur}\n`;
-
-        // Build SRT safely
-        const start = (typeof scene.timestamp === "number" && !isNaN(scene.timestamp)) ? scene.timestamp : (validScenesCount * 5);
-        const end = start + sceneDur;
-        srtContent += `${validScenesCount + 1}\n`;
-        srtContent += `${formatSrtTime(start)} --> ${formatSrtTime(end)}\n`;
-        srtContent += `${scene.text || ""}\n\n`;
-        validScenesCount++;
-      }
-      
-      // FFmpeg quirk: last image needs to be repeated or it might be cut off
-      if (imagePaths.length > 0) {
-        concatContent += `file '${path.resolve(imagePaths[imagePaths.length - 1])}'\n`;
       }
 
-      fs.writeFileSync(concatFilePath, concatContent);
+      if (scenesToStitch.length === 0) {
+        return res.status(400).json({ error: "No valid scenes could be parsed or stitched." });
+      }
+
       fs.writeFileSync(srtFilePath, srtContent);
 
       const outputPath = path.join(sessionDir, "output.mp4");
 
-      const vfParams = `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,subtitles=${path.resolve(srtFilePath).replace(/\\/g, '/').replace(/:/g, '\\\\:')}:force_style='Fontname=Arial,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,Alignment=2,MarginV=50'`;
+      // Setup FFmpeg with dynamic loop inputs
+      let ff = ffmpeg();
+      for (const sc of scenesToStitch) {
+        ff = ff.input(sc.imgPath).inputOptions(["-loop 1", `-t ${sc.duration}`]);
+      }
+      ff = ff.input(audioPath);
 
-      console.log("Starting FFmpeg stitch for session:", sessionId);
+      // Build video filter complex
+      let filterComplex = "";
+      for (let i = 0; i < scenesToStitch.length; i++) {
+        filterComplex += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30[v${i}]; `;
+      }
 
-      ffmpeg()
-        .input(concatFilePath)
-        .inputOptions(["-f concat", "-safe 0"])
-        .input(audioPath)
-        .outputOptions([
-          '-c:v libx264',
-          '-pix_fmt yuv420p',
-          `-vf`, vfParams,
-          '-preset fast',
-          '-crf 22',
-          '-c:a aac',
-          '-b:a 192k',
-          '-shortest', // Finish when audio ends
-          '-movflags +faststart'
-        ])
-        .save(outputPath)
-        .on('end', () => {
-          console.log("Stitching finished! Sending MP4 back.");
-          res.download(outputPath, "video.mp4", (err) => {
-            if (err) console.error("Error sending file:", err);
-            
-            // Cleanup session directory
-            setTimeout(() => {
-              fs.rm(sessionDir, { recursive: true, force: true }, () => {});
-            }, 10000); // 10s delay to ensure file is sent
-          });
-        })
-        .on('error', (err) => {
-          console.error("FFmpeg stitching error:", err);
-          res.status(500).json({ error: "Stitching failed: " + err.message });
-          fs.rm(sessionDir, { recursive: true, force: true }, () => {});
+      const concatInputs = scenesToStitch.map((_, i) => `[v${i}]`).join('');
+      filterComplex += `${concatInputs}concat=n=${scenesToStitch.length}:v=1:a=0[vconcat]; `;
+
+      // Render subtitles safely
+      const cleanSubtitlesPath = path.resolve(srtFilePath).replace(/\\/g, '/').replace(/:/g, '\\\\:');
+      filterComplex += `[vconcat]subtitles=${cleanSubtitlesPath}:force_style='Fontname=Arial,Fontsize=14,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,Alignment=2,MarginV=50'[v]`;
+
+      console.log(`Starting unified dynamic FFmpeg stitch with ${scenesToStitch.length} streams...`);
+
+      ff.outputOptions([
+        '-filter_complex', filterComplex,
+        '-map', '[v]',
+        '-map', `${scenesToStitch.length}:a`,
+        '-c:v libx264',
+        '-pix_fmt yuv420p',
+        '-preset fast',
+        '-crf 22',
+        '-c:a aac',
+        '-b:a 192k',
+        '-shortest', // Stop encoding when audio is finished
+        '-movflags +faststart'
+      ])
+      .save(outputPath)
+      .on('end', () => {
+        console.log("Stitching finished! Sending MP4 back.");
+        res.download(outputPath, "video.mp4", (err) => {
+          if (err) console.error("Error sending file:", err);
+          
+          // Cleanup session directory
+          setTimeout(() => {
+            fs.rm(sessionDir, { recursive: true, force: true }, () => {});
+          }, 10000); // 10s delay to ensure file is sent
         });
+      })
+      .on('error', (err) => {
+        console.error("FFmpeg stitching error:", err);
+        res.status(500).json({ error: "Stitching failed: " + err.message });
+        fs.rm(sessionDir, { recursive: true, force: true }, () => {});
+      });
 
     } catch (error: any) {
       console.error("Setup error for stitching:", error);

@@ -240,39 +240,6 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
             }
         }
         
-        // Normalize with FFmpeg to absolutely guarantee identical dimensions for ffmpeg concat
-        try {
-            const imgPath = path.join(sessionDir, `img_${i}.jpg`);
-            if (fs.existsSync(imgPath)) {
-                const rawTempPath = path.join(sessionDir, `raw_temp_${i}.jpg`);
-                fs.renameSync(imgPath, rawTempPath);
-                
-                await new Promise<void>((resolve, reject) => {
-                    ffmpeg(rawTempPath)
-                        .outputOptions([
-                            '-vf', 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920',
-                            '-vframes', '1'
-                        ])
-                        .save(imgPath)
-                        .on('end', () => resolve())
-                        .on('error', (err) => reject(err));
-                });
-                
-                if (fs.existsSync(rawTempPath)) {
-                    fs.unlinkSync(rawTempPath);
-                }
-                
-                const normalizedBuffer = fs.readFileSync(imgPath);
-                job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + normalizedBuffer.toString('base64');
-            }
-        } catch(e) {
-            console.error(`Failed to normalize image with FFmpeg for scene ${i}:`, e);
-            if (i > 0) {
-                 fs.copyFileSync(path.join(sessionDir, `img_${i-1}.jpg`), path.join(sessionDir, `img_${i}.jpg`));
-                 job.scenes[i].imageUrl = job.scenes[i-1].imageUrl;
-            }
-        }
-        
         job.progress = 25 + (i / job.scenes.length) * 60;
         activeJobs.set(jobId, { ...job });
     }
@@ -363,38 +330,51 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
             activeJobs.set(jobId, { ...job });
             
             // SERVER-SIDE FAST MP4 STITCH
-            console.log(`[${jobId}] Fast stitching video on server...`);
-            const concatFilePath = path.join(sessionDir, "concat.txt");
-            let concatContent = "";
+            console.log(`[${jobId}] Fast stitching video on server via dynamic filter chain...`);
+            
+            const scenesToStitch: { imgPath: string; duration: number }[] = [];
             for (let i = 0; i < job.scenes.length; i++) {
-                const imgPathAbsolute = path.resolve(path.join(sessionDir, `img_${i}.jpg`));
-                const nextTimestamp = i < job.scenes.length - 1 ? job.scenes[i+1].timestamp : job.scenes[i].timestamp + 5;
-                const dur = Math.max(0.1, nextTimestamp - job.scenes[i].timestamp);
-                concatContent += `file '${imgPathAbsolute.replace(/'/g, "'\\''")}'\n`;
-                concatContent += `duration ${dur}\n`;
+                const imgPath = path.join(sessionDir, `img_${i}.jpg`);
+                if (fs.existsSync(imgPath)) {
+                    const nextTimestamp = i < job.scenes.length - 1 ? job.scenes[i+1].timestamp : job.scenes[i].timestamp + 5;
+                    const dur = Math.max(0.1, nextTimestamp - job.scenes[i].timestamp);
+                    scenesToStitch.push({ imgPath, duration: dur });
+                }
             }
-            // Repeat last frame due to ffmpeg quirk
-            if (job.scenes.length > 0) {
-               concatContent += `file '${path.resolve(path.join(sessionDir, `img_${job.scenes.length-1}.jpg`)).replace(/'/g, "'\\''")}'\n`;
+
+            if (scenesToStitch.length === 0) {
+                throw new Error("No scenes found for stitching");
             }
-            fs.writeFileSync(concatFilePath, concatContent);
+
+            let ff = ffmpeg();
+            for (const sc of scenesToStitch) {
+                ff = ff.input(sc.imgPath).inputOptions(["-loop 1", `-t ${sc.duration}`]);
+            }
+            ff = ff.input(audioPath);
+
+            let filterComplex = "";
+            for (let i = 0; i < scenesToStitch.length; i++) {
+                filterComplex += `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30[v${i}]; `;
+            }
+            const concatInputs = scenesToStitch.map((_, i) => `[v${i}]`).join('');
+            filterComplex += `${concatInputs}concat=n=${scenesToStitch.length}:v=1:a=0[v]`;
 
             const outputPath = path.join(sessionDir, 'output.mp4');
             await new Promise<void>((resolve, reject) => {
-                ffmpeg()
-                  .input(concatFilePath)
-                  .inputOptions(['-f concat', '-safe 0'])
-                  .input(audioPath)
-                  .outputOptions([
+                ff.outputOptions([
+                    '-filter_complex', filterComplex,
+                    '-map', '[v]',
+                    '-map', `${scenesToStitch.length}:a`,
                     "-c:v libx264",
                     "-pix_fmt yuv420p",
                     "-c:a aac",
                     "-b:a 192k",
-                    "-shortest"
-                  ])
-                  .save(outputPath)
-                  .on('end', () => resolve())
-                  .on('error', (err) => reject(err));
+                    "-shortest",
+                    "-movflags +faststart"
+                ])
+                .save(outputPath)
+                .on('end', () => resolve())
+                .on('error', (err) => reject(err));
             });
             console.log(`[${jobId}] MP4 Rendered locally! Uploading to release...`);
 
