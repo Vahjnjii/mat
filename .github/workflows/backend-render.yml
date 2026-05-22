@@ -1,0 +1,54 @@
+name: Backend Video Render
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: 'The story script to generate the video for'
+        required: true
+        type: string
+        default: 'In a dark dystopian future, neon lights flicker on cracked pavement. A lone figure walks through the pouring rain, holding a glowing umbrella.'
+      gemini_api_key:
+        description: 'Gemini API Key (Required for AI generation)'
+        required: true
+        type: string
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Puppeteer (for Headless Rendering)
+        run: npm install puppeteer
+
+      - name: Run Backend Rendering
+        env:
+          GEMINI_API_KEY: ${{ github.event.inputs.gemini_api_key }}
+        run: node scripts/headless-render.js "${{ github.event.inputs.script }}"
+
+      - name: Convert to MP4
+        run: |
+          if [ -f output/rendered-video.webm ]; then
+            ffmpeg -i output/rendered-video.webm -c:v libx264 -preset slow -crf 18 -c:a aac -b:a 192k output/final-production.mp4
+          fi
+
+      - name: Upload Video Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rendered-Video
+          path: |
+            output/final-production.mp4
+            output/rendered-video.webm
+          retention-days: 7

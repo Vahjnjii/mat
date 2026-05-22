@@ -1,0 +1,8 @@
+{
+  "name": "FluxVideo Studio 3v",
+  "description": "Create stunning anime-style emotional videos with deep voiceovers, powered by Flux and Gemini TTS.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
