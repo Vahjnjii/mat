@@ -67,7 +67,7 @@ async function startServer() {
   // Create a new Background Generation Job
   app.post("/api/generate", (req, res) => {
     try {
-      const { script, apiKeys, imageWorkers, githubToken, voice } = req.body;
+      const { script, apiKeys, imageWorkers, githubToken, voice, repoName } = req.body;
       if (!script) return res.status(400).json({ error: "Missing script" });
       if (!githubToken) return res.status(400).json({ error: "Missing githubToken" });
       if (!apiKeys || apiKeys.length === 0) return res.status(400).json({ error: "Missing Gemini APIs" });
@@ -75,7 +75,7 @@ async function startServer() {
       const jobId = Date.now().toString();
       
       // Kickoff background job
-      runJob(jobId, script, apiKeys, imageWorkers, githubToken, voice).catch(err => {
+      runJob(jobId, script, apiKeys, imageWorkers, githubToken, voice, repoName || "ai-studio-video-projects").catch(err => {
         console.error("Job runner crashed:", err);
       });
 

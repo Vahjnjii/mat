@@ -46,7 +46,7 @@ const generateWithRetry = async (params: any, keys: string[]) => {
   throw new Error(`Failed after ${attempts} key(s): ` + lastError);
 };
 
-export async function runJob(jobId: string, script: string, apiKey: string[], imageWorkers: string[], githubToken: string, selectedVoice: string) {
+export async function runJob(jobId: string, script: string, apiKey: string[], imageWorkers: string[], githubToken: string, selectedVoice: string, repoName: string) {
   const job: JobState = {
     id: jobId,
     status: 'generating_voice',
@@ -240,10 +240,163 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
         activeJobs.set(jobId, { ...job });
     }
 
+    job.status = 'uploading';
+    job.progress = 85;
+    activeJobs.set(jobId, { ...job });
+    console.log(`[${jobId}] Image generation complete! Uploading project tree to GitHub...`);
+    
+    // --- SERVER-SIDE GITHUB PUSH ---
+    try {
+        if (githubToken) {
+            const octokit = new (await import("@octokit/rest")).Octokit({ auth: githubToken });
+            const { data: user } = await octokit.users.getAuthenticated();
+            const owner = user.login;
+            const repo = repoName || "ai-studio-video-projects";
+            
+            try {
+              await octokit.repos.get({ owner, repo });
+            } catch(e: any) {
+              if (e.status === 404) {
+                 await octokit.repos.createForAuthenticatedUser({ name: repo, private: true, auto_init: true });
+                 await new Promise(r => setTimeout(r, 4000));
+              }
+            }
+
+            let refSha, baseTreeSha;
+            try {
+              const { data: ref } = await octokit.git.getRef({ owner, repo, ref: 'heads/main' });
+              refSha = ref.object.sha;
+              const { data: commit } = await octokit.git.getCommit({ owner, repo, commit_sha: refSha });
+              baseTreeSha = commit.tree.sha;
+            } catch (e: any) {}
+
+            const treeData: any[] = [];
+            
+            // Script
+            const scriptBlob = await octokit.git.createBlob({ owner, repo, content: Buffer.from(script).toString('base64'), encoding: 'base64' });
+            treeData.push({ path: `projects/${jobId}/script.txt`, mode: '100644', type: 'blob', sha: scriptBlob.data.sha });
+            
+            // Timeline & Metadata
+            let timelineText = "";
+            for (let i = 0; i < job.scenes.length; i++) {
+                timelineText += `file 'images/scene_${i}.jpg'\n`;
+                const nextTimestamp = i < job.scenes.length - 1 ? job.scenes[i+1].timestamp : job.scenes[i].timestamp + 5;
+                timelineText += `duration ${nextTimestamp - job.scenes[i].timestamp}\n`;
+            }
+            const timelineBlob = await octokit.git.createBlob({ owner, repo, content: Buffer.from(timelineText).toString('base64'), encoding: 'base64' });
+            treeData.push({ path: `projects/${jobId}/timeline.txt`, mode: '100644', type: 'blob', sha: timelineBlob.data.sha });
+            
+            const metaStr = JSON.stringify({ scenes: job.scenes });
+            const metaBlob = await octokit.git.createBlob({ owner, repo, content: Buffer.from(metaStr).toString('base64'), encoding: 'base64' });
+            treeData.push({ path: `projects/${jobId}/metadata.json`, mode: '100644', type: 'blob', sha: metaBlob.data.sha });
+
+            // Images
+            for (let i = 0; i < job.scenes.length; i++) {
+                const imgPath = path.join(sessionDir, `img_${i}.jpg`);
+                if (fs.existsSync(imgPath)) {
+                    const imgBuffer = fs.readFileSync(imgPath);
+                    const b = await octokit.git.createBlob({ owner, repo, content: imgBuffer.toString('base64'), encoding: 'base64' });
+                    treeData.push({ path: `projects/${jobId}/images/scene_${i}.jpg`, mode: '100644', type: 'blob', sha: b.data.sha });
+                }
+            }
+
+            // Audio
+            const audioPath = path.join(sessionDir, "audio.wav");
+            if (fs.existsSync(audioPath)) {
+                const audioBuffer = fs.readFileSync(audioPath);
+                const b = await octokit.git.createBlob({ owner, repo, content: audioBuffer.toString('base64'), encoding: 'base64' });
+                treeData.push({ path: `projects/${jobId}/audio.wav`, mode: '100644', type: 'blob', sha: b.data.sha });
+            }
+
+            const treeParams: any = { owner, repo, tree: treeData };
+            if (baseTreeSha) treeParams.base_tree = baseTreeSha;
+            const { data: newTree } = await octokit.git.createTree(treeParams);
+            const commitParams: any = { owner, repo, message: `Add project assets for ${jobId}`, tree: newTree.sha };
+            if (refSha) commitParams.parents = [refSha];
+            const { data: newCommit } = await octokit.git.createCommit(commitParams);
+            if (refSha) {
+                await octokit.git.updateRef({ owner, repo, ref: 'heads/main', sha: newCommit.sha });
+            } else {
+                await octokit.git.createRef({ owner, repo, ref: 'refs/heads/main', sha: newCommit.sha });
+            }
+            console.log(`[${jobId}] Project tree written to GitHub!`);
+            
+            job.progress = 90;
+            job.status = 'stitching';
+            activeJobs.set(jobId, { ...job });
+            
+            // SERVER-SIDE FAST MP4 STITCH
+            console.log(`[${jobId}] Fast stitching video on server...`);
+            const concatFilePath = path.join(sessionDir, "concat.txt");
+            let concatContent = "";
+            for (let i = 0; i < job.scenes.length; i++) {
+                const imgPathAbsolute = path.resolve(path.join(sessionDir, `img_${i}.jpg`));
+                const nextTimestamp = i < job.scenes.length - 1 ? job.scenes[i+1].timestamp : job.scenes[i].timestamp + 5;
+                const dur = Math.max(0.1, nextTimestamp - job.scenes[i].timestamp);
+                concatContent += `file '${imgPathAbsolute.replace(/'/g, "'\\''")}'\n`;
+                concatContent += `duration ${dur}\n`;
+            }
+            // Repeat last frame due to ffmpeg quirk
+            if (job.scenes.length > 0) {
+               concatContent += `file '${path.resolve(path.join(sessionDir, `img_${job.scenes.length-1}.jpg`)).replace(/'/g, "'\\''")}'\n`;
+            }
+            fs.writeFileSync(concatFilePath, concatContent);
+
+            const outputPath = path.join(sessionDir, 'output.mp4');
+            await new Promise<void>((resolve, reject) => {
+                ffmpeg()
+                  .input(concatFilePath)
+                  .inputOptions(['-f concat', '-safe 0'])
+                  .input(audioPath)
+                  .outputOptions([
+                    "-c:v libx264",
+                    "-pix_fmt yuv420p",
+                    "-c:a aac",
+                    "-b:a 192k",
+                    "-shortest"
+                  ])
+                  .save(outputPath)
+                  .on('end', () => resolve())
+                  .on('error', (err) => reject(err));
+            });
+            console.log(`[${jobId}] MP4 Rendered locally! Uploading to release...`);
+
+            // Check release exist
+            const tag = `vid-${jobId}`;
+            let uploadUrl = "";
+            try {
+                const { data: rel } = await octokit.repos.getReleaseByTag({ owner, repo, tag });
+                uploadUrl = rel.upload_url;
+            } catch(e) {
+                const { data: newRel } = await octokit.repos.createRelease({ owner, repo, tag_name: tag, name: `Video ${jobId}`, body: "Rendered completely automatically via Server Background Thread" });
+                uploadUrl = newRel.upload_url;
+            }
+            
+            // Upload to release
+            const fileData = fs.readFileSync(outputPath);
+            await axios.post(
+              uploadUrl.replace("{?name,label}", `?name=output.mp4`),
+              fileData,
+              {
+                headers: {
+                  'Authorization': `token ${githubToken}`,
+                  'Content-Type': 'video/mp4'
+                },
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity
+              }
+            );
+            console.log(`[${jobId}] Stitched video successfully uploaded to Release!`);
+        }
+    } catch(dbErr: any) {
+        console.error(`[${jobId}] Failed to upload tree or stitch on server side:`, dbErr);
+    }
+    // --- END SERVER-SIDE PUSH ---
+
     job.status = 'completed';
     job.progress = 100;
     activeJobs.set(jobId, { ...job });
-    console.log(`[${jobId}] Image generation and audio complete! Ready for canvas rendering.`);
+    console.log(`[${jobId}] All tasks for ${jobId} complete! Ready for UI consumption.`);
     
     // Cleanup memory after a while, let frontend grab it
     setTimeout(() => {

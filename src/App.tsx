@@ -1092,13 +1092,15 @@ jobs:
 
   useEffect(() => {
     if (autoRecordSignal && scenes.length > 0 && !isGenerating && !isPlaying && audioUrl) {
-      handleRecordVideo(autoRecordSignal);
+      handleStitchVideo(autoRecordSignal);
       setAutoRecordSignal(null);
     }
   }, [scenes, isGenerating, isPlaying, audioUrl, autoRecordSignal]);
 
-  const handleStitchVideo = async () => {
+  const handleStitchVideo = async (targetProjectId?: string) => {
     if (scenes.length === 0 || !audioUrl) return;
+    
+    const finalProjectId = targetProjectId || selectedProjectId || localStorage.getItem('lastProjectId') || `temp_${Date.now()}`;
     setStatus('Sending to server for high-speed FFmpeg stitching...');
     setProgress(0);
     
@@ -1168,12 +1170,55 @@ jobs:
       const videoBlob = await response.blob();
       const videoUrl = URL.createObjectURL(videoBlob);
       
+      // Upload to Github Release instantly
+      if (githubToken && user && finalProjectId) {
+         setStatus('Uploading instant stitched MP4 to GitHub Releases...');
+         try {
+             const octokit = new Octokit({ auth: githubToken });
+             const owner = user.login;
+             const repo = getProjectRepoName();
+             
+             // Read as buffer
+             const arrayBuffer = await videoBlob.arrayBuffer();
+             const buffer = Buffer.from(arrayBuffer);
+             
+             // Get or create release
+             let uploadUrl = "";
+             const tag = `vid-${finalProjectId}`;
+             try {
+                const { data: rel } = await octokit.repos.getReleaseByTag({ owner, repo, tag });
+                uploadUrl = rel.upload_url;
+             } catch(e: any) {
+                const { data: newRel } = await octokit.repos.createRelease({ owner, repo, tag_name: tag, name: `Video ${finalProjectId || ''}`, body: "Rendered instantly via FFmpeg" });
+                uploadUrl = newRel.upload_url;
+             }
+             
+             // Upload asset
+             await octokit.repos.uploadReleaseAsset({
+                url: uploadUrl,
+                headers: {
+                    'content-type': 'video/mp4',
+                    'content-length': buffer.length
+                },
+                name: 'output.mp4',
+                data: buffer as any
+             });
+             setStatus('Ready! Saved securely to GitHub.');
+             
+             // Update local dbProjects URL
+             fetchProjects(octokit, owner);
+         } catch(e) {
+             console.warn("Failed to upload to Github release", e);
+         }
+      }
+      
       const a = document.createElement("a");
       a.href = videoUrl;
       a.download = `video_stitch_${Date.now()}.mp4`;
+      // We only auto-download if it wasn't a background job, but it's safe to just let them download it anyway
       a.click();
       URL.revokeObjectURL(videoUrl);
-      setStatus('Video generated successfully!');
+      setStatus('Video rendered and saved successfully!');
 
     } catch (err: any) {
       console.error("Stitching error:", err);
@@ -1595,7 +1640,7 @@ jobs:
                    duration: job.duration
                 });
              } catch(err) {
-                console.error("Failed to save to localforage", err);
+                console.error("Failed to save full project to github or local cache", err);
              }
              
              // Update dbProjects
@@ -1656,7 +1701,8 @@ jobs:
         apiKeys: apiKeys,
         imageWorkers: imageUrls,
         githubToken: githubToken || "",
-        voice: selectedVoice
+        voice: selectedVoice,
+        repoName: getProjectRepoName()
       };
 
       const res = await fetch("/api/generate", {
@@ -2252,10 +2298,10 @@ jobs:
              {selectedProjectId && dbProjects.find(p => p.id === selectedProjectId) && (
                (dbProjects.find(p => p.id === selectedProjectId)?.status === 'ready' && selectedProjectId !== activeJobId) ? (
                  <button 
-                   onClick={() => handleRecordVideo()}
-                   disabled={scenes.length === 0 || !audioUrl || isRecordingRef.current}
+                   onClick={() => handleStitchVideo()}
+                   disabled={scenes.length === 0 || !audioUrl}
                    className="hidden sm:flex items-center gap-2 border border-orange-500/30 bg-orange-500/10 hover:bg-orange-500/20 text-orange-500 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
-                   title="Renders the video locally in your browser"
+                   title="Fast renders the video instantly via FFmpeg"
                  >
                    <Download size={14} />
                    Export MP4
