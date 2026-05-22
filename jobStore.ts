@@ -169,10 +169,18 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
                   if (b64) {
                     const base64Data = b64.replace(/^data:image\/\w+;base64,/, "");
                     finalImgBuffer = Buffer.from(base64Data, 'base64');
+                  } else {
+                     throw new Error("JSON response did not contain image generation payload.");
                   }
                 } catch(e) {
-                  // ignore parse err
+                  throw new Error("Failed to parse JSON response from image generation API.");
                 }
+             } else if (imgBufferRaw[0] === 60) { // 60 is '<' for HTML
+                 throw new Error("Received HTML error page instead of image.");
+             }
+             
+             if (finalImgBuffer.length < 5000) {
+                 throw new Error("Generated image buffer is impossibly small, likely an error.");
              }
 
              const imgPath = path.join(sessionDir, `img_${i}.jpg`);
@@ -189,16 +197,24 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
         if (!success) {
            console.log(`[${jobId}] Attempting Pollinations fallback for scene ${i}`);
            try {
-              const polyRes = await axios.get(`https://image.pollinations.ai/prompt/${encodeURIComponent(fullPrompt)}?width=768&height=1344&nologo=true`, {
+              // Truncate prompt to ~800 chars to avoid 414 URI Too Long
+              let polyPrompt = fullPrompt;
+              if (polyPrompt.length > 800) polyPrompt = polyPrompt.substring(0, 800) + '...';
+              
+              const polyRes = await axios.get(`https://image.pollinations.ai/prompt/${encodeURIComponent(polyPrompt)}?width=768&height=1344&nologo=true`, {
                   responseType: 'arraybuffer', timeout: 20000
               });
+              
               const imgBuffer = Buffer.from(polyRes.data, 'binary');
+              if (imgBuffer[0] === 60) throw new Error("Pollinations returned HTML");
+              if (imgBuffer.length < 5000) throw new Error("Pollinations image too small");
+              
               const imgPath = path.join(sessionDir, `img_${i}.jpg`);
               fs.writeFileSync(imgPath, imgBuffer);
               job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + imgBuffer.toString('base64');
               success = true;
-           } catch(e) {
-              console.warn(`[${jobId}] Pollinations fallback failed for scene ${i}`);
+           } catch(e: any) {
+              console.warn(`[${jobId}] Pollinations fallback failed for scene ${i}:`, e.message);
            }
         }
 
@@ -206,11 +222,11 @@ export async function runJob(jobId: string, script: string, apiKey: string[], im
         if (!success) {
             console.error(`Failed to generate image ${i}, using basic safe fallback image`);
             try {
-              // A completely safe, non-blocked prompt to ensure we get a valid frame at least
               const polyRes = await axios.get(`https://image.pollinations.ai/prompt/cinematic%20anime%20scene%20beautiful%20sky?width=768&height=1344`, {
                  responseType: 'arraybuffer', timeout: 10000
               });
               const imgBuffer = Buffer.from(polyRes.data, 'binary');
+              if (imgBuffer[0] === 60) throw new Error("Placeholder HTML");
               fs.writeFileSync(path.join(sessionDir, `img_${i}.jpg`), imgBuffer);
               job.scenes[i].imageUrl = 'data:image/jpeg;base64,' + imgBuffer.toString('base64');
             } catch(e) {

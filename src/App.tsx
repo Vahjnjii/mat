@@ -1421,7 +1421,9 @@ jobs:
 
     try {
       console.log(`[Flux Frontend] Using Pollinations fallback`);
-      const response = await fetch(`https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=720&height=1280&nologo=true`, {
+      let polyPrompt = prompt;
+      if (polyPrompt.length > 800) polyPrompt = polyPrompt.substring(0, 800) + '...';
+      const response = await fetch(`https://image.pollinations.ai/prompt/${encodeURIComponent(polyPrompt)}?width=720&height=1280&nologo=true`, {
         signal: AbortSignal.timeout(15000)
       });
       if (response.ok) {
@@ -1565,31 +1567,6 @@ jobs:
     setProgress(0);
     setScenes([]);
     setAudioUrl(null);
-
-    // If we have github token and we are NOT in headless mode, trigger the Github Action by uploading the raw script!
-    if (!(window as any).isHeadless && githubToken && user) {
-       setStatus('Dispatching script to GitHub Actions for headless canvas rendering...');
-       try {
-         const timestamp = Date.now().toString();
-         const octokit = new Octokit({ auth: githubToken });
-         await uploadRawProjectToGitHub(octokit, user.login, timestamp, textToUse, apiKeys, imageUrls);
-         
-         setStatus('Sent to GitHub Actions. Video will be available in History once rendered.');
-         setSelectedProjectId(null);
-         
-         // Add optimistic pending project so they see it polling
-         setDbProjects(prev => {
-            const newProj: Project = { id: timestamp, status: 'rendering', script: textToUse, userId: user.login, createdAt: new Date() };
-            return [newProj, ...(prev || [])];
-         });
-         
-         setIsGenerating(false);
-       } catch(err: any) {
-         setError(err.message || "Failed to dispatch to Github Actions");
-         setIsGenerating(false);
-       }
-       return;
-    }
 
     setStatus('Dispatching task to AI Studio backend...');
     setSelectedProjectId(null);
@@ -1762,7 +1739,10 @@ jobs:
       ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
       if (currentScene?.imageUrl) {
-        if (img.src !== currentScene.imageUrl) img.src = currentScene.imageUrl;
+        if (img.getAttribute('data-src') !== currentScene.imageUrl) {
+            img.setAttribute('data-src', currentScene.imageUrl);
+            img.src = currentScene.imageUrl;
+        }
         if (img.complete && img.naturalWidth !== 0) {
           const shakeX = Math.sin(time / 150) * 1.5;
           const shakeY = Math.cos(time / 180) * 1.5;
@@ -2192,26 +2172,15 @@ jobs:
 
              {selectedProjectId && dbProjects.find(p => p.id === selectedProjectId) && (
                (dbProjects.find(p => p.id === selectedProjectId)?.status === 'ready' && selectedProjectId !== activeJobId) ? (
-                 <>
                  <button 
                    onClick={() => handleRecordVideo()}
                    disabled={scenes.length === 0 || !audioUrl || isRecordingRef.current}
                    className="hidden sm:flex items-center gap-2 border border-orange-500/30 bg-orange-500/10 hover:bg-orange-500/20 text-orange-500 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed"
+                   title="Renders the video locally in your browser"
                  >
                    <Download size={14} />
-                   Export Canvas Video
+                   Export MP4
                  </button>
-                 <button 
-                   onClick={() => {
-                     const url = dbProjects.find(p => p.id === selectedProjectId)?.videoUrl;
-                     if (url) window.open(url, '_blank');
-                   }}
-                   className="hidden sm:flex items-center gap-2 border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap"
-                 >
-                   <Download size={14} />
-                   Get Actions MP4
-                 </button>
-                 </>
                ) : (
                  <button 
                    disabled
